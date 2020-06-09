@@ -187,7 +187,7 @@ pub fn load_processes<C: Chip>(
                 .ok_or(ProcessLoadError::NotEnoughFlash)?;
 
             // Try to create a process object from that app slice.
-            let (process, memory_offset) = Process::create(
+            let (process, memory_offset, bytes_consumed) = Process::create(
                 kernel,
                 chip,
                 app_flash,
@@ -209,8 +209,8 @@ pub fn load_processes<C: Chip>(
                         i,
                         app_flash.as_ptr() as usize,
                         app_flash.as_ptr() as usize + app_flash.len(),
-                        app_memory_ptr as usize,
                         app_memory_ptr as usize + memory_offset,
+                        app_memory_ptr as usize + bytes_consumed,
                         process.map(|p| p.get_process_name())
                     );
                 }
@@ -222,8 +222,8 @@ pub fn load_processes<C: Chip>(
             remaining_flash = remaining_flash
                 .get(app_flash.len()..)
                 .ok_or(ProcessLoadError::NotEnoughFlash)?;
-            app_memory_ptr = app_memory_ptr.add(memory_offset);
-            app_memory_size -= memory_offset;
+            app_memory_ptr = app_memory_ptr.add(bytes_consumed);
+            app_memory_size -= bytes_consumed;
         }
     }
 
@@ -1495,6 +1495,14 @@ fn exceeded_check(size: usize, allocated: usize) -> &'static str {
 }
 
 impl<C: 'static + Chip> Process<'_, C> {
+    /// Setup a new process object.
+    ///
+    /// On success, returns Ok with
+    /// - The Process object
+    /// - The number of bytes skipped at the beginning of the memory region
+    ///   passed to `create()`.
+    /// - The total number of bytes used from the memory region passed to
+    ///   `create()`.
     pub(crate) unsafe fn create(
         kernel: &'static Kernel,
         chip: &'static C,
@@ -1505,7 +1513,7 @@ impl<C: 'static + Chip> Process<'_, C> {
         remaining_app_memory_size: usize,
         fault_response: FaultResponse,
         index: usize,
-    ) -> Result<(Option<&'static dyn ProcessType>, usize), ProcessLoadError> {
+    ) -> Result<(Option<&'static dyn ProcessType>, usize, usize), ProcessLoadError> {
         // Get a slice for just the app header.
         let header_flash = app_flash
             .get(0..header_length as usize)
@@ -1554,7 +1562,7 @@ impl<C: 'static + Chip> Process<'_, C> {
                     );
                 }
             }
-            return Ok((None, 0));
+            return Ok((None, 0, 0));
         }
 
         // Otherwise, actually load the app.
@@ -1619,10 +1627,45 @@ impl<C: 'static + Chip> Process<'_, C> {
         // Minimum memory size for the process.
         let min_total_memory_size = min_app_ram_size + initial_kernel_memory_size;
 
+        // Check if this process requires a fixed memory start address. If so,
+        // try to adjust the memory region to work for this process.
+        //
+        // Right now, we only support skipping some RAM and leaving a chunk
+        // unused so that the memory region starts where the process needs it
+        // to.
+        let (new_memory_start, new_memory_size) =
+            if let Some(fixed_memory_start) = tbf_header.get_fixed_address_ram() {
+                // The process does have a fixed address. See if it comes after
+                // where we are in memory.
+                if fixed_memory_start > remaining_app_memory as u32 {
+                    let diff: usize = (fixed_memory_start - remaining_app_memory as u32) as usize;
+                    if diff > remaining_app_memory_size {
+                        // We ran out of memory. Return the original range since (in
+                        // this step) we were unable to meet the process's
+                        // requirements.
+                        (remaining_app_memory, remaining_app_memory_size)
+                    } else {
+                        // Change the memory range to start where the process
+                        // requested it, and subtract the number of skipped bytes
+                        // from the length of the remaining memory.
+                        (
+                            fixed_memory_start as *mut u8,
+                            remaining_app_memory_size - diff,
+                        )
+                    }
+                } else {
+                    // Address already matches, or is earlier in memory, nothing we
+                    // have to do (or can do).
+                    (remaining_app_memory, remaining_app_memory_size)
+                }
+            } else {
+                (remaining_app_memory, remaining_app_memory_size)
+            };
+
         // Determine where process memory will go and allocate MPU region for app-owned memory.
         let (memory_start, memory_size) = match chip.mpu().allocate_app_memory_region(
-            remaining_app_memory as *const u8,
-            remaining_app_memory_size,
+            new_memory_start as *const u8,
+            new_memory_size,
             min_total_memory_size,
             initial_app_memory_size,
             initial_kernel_memory_size,
@@ -1818,7 +1861,11 @@ impl<C: 'static + Chip> Process<'_, C> {
         kernel.increment_work();
 
         // return
-        Ok((Some(process), memory_padding_size + memory_size))
+        Ok((
+            Some(process),
+            memory_padding_size,
+            memory_padding_size + memory_size,
+        ))
     }
 
     /// Attempt to restart the process.
