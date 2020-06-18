@@ -17,6 +17,7 @@ use super::usbc_client_ctrl::ClientCtrl;
 use kernel::common::cells::OptionalCell;
 use kernel::common::cells::TakeCell;
 use kernel::common::cells::VolatileCell;
+use kernel::debug;
 use kernel::hil;
 use kernel::hil::uart;
 use kernel::hil::usb::TransferType;
@@ -73,6 +74,11 @@ enum State {
     Connected,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum CdcControlRequests {
+    SetLineCoding,
+}
+
 /// Implementation of the Abstract Control Model (ACM) for the Communications
 /// Class Device (CDC) over USB.
 pub struct CdcAcm<'a, U: 'a> {
@@ -85,6 +91,9 @@ pub struct CdcAcm<'a, U: 'a> {
     /// Current state of the CDC driver. This helps us track if a CDC client is
     /// connected and listening or not.
     state: Cell<State>,
+
+    control_request: OptionalCell<CdcControlRequests>,
+    baud_rate: Cell<u32>,
 
     /// A holder reference for the TX buffer we are transmitting from.
     tx_buffer: TakeCell<'static, [u8]>,
@@ -215,6 +224,8 @@ impl<'a, U: hil::usb::UsbController<'a>> CdcAcm<'a, U> {
                 Buffer64::default(),
             ],
             state: Cell::new(State::Disabled),
+            control_request: OptionalCell::empty(),
+            baud_rate: Cell::new(0),
             tx_buffer: TakeCell::empty(),
             tx_len: Cell::new(0),
             tx_offset: Cell::new(0),
@@ -275,28 +286,34 @@ impl<'a, U: hil::usb::UsbController<'a>> hil::usb::Client<'a> for CdcAcm<'a, U> 
             let b_request = setup_data.request_code;
             let value = setup_data.value;
 
-            // Match on the two CDC control messages we care about:
+            // Match on the three CDC control messages we care about:
+            // - `0x22`: SET_LINE_CODING
             // - `0x22`: SET_LINE_CONTROL_STATE
             // - `0x23`: SEND_BREAK
             match b_request {
+                0x20 => {
+                    // set line coding like baud rate
+                    self.control_request.set(CdcControlRequests::SetLineCoding);
+                }
                 0x22 => {
                     // This message seems to come with different values. We
                     // don't care about the actual value's meaning, except for
                     // value=0 which seems to bookend when the CDC client is
                     // actually attached.
-                    if value == 0 {
-                        // On Linux, this seems to be a good signal of both when
-                        // a client connects and disconnects. So, based on our
-                        // current state, we can update our state.
-                        if self.state.get() != State::Connected {
-                            // We weren't previously connected so this must mean
-                            // a client connected.
-                            self.state.set(State::Connecting);
-                        } else {
-                            // We were connected, so disconnect.
-                            self.state.set(State::Enumerated)
-                        }
-                    }
+                    // if value == 0 {
+                    // On Linux, this seems to be a good signal of both when
+                    // a client connects and disconnects. So, based on our
+                    // current state, we can update our state.
+                    // if self.state.get() != State::Connected {
+                    //     // We weren't previously connected so this must mean
+                    //     // a client connected.
+                    //     self.state.set(State::Connecting);
+                    // }
+                    // else {
+                    // We were connected, so disconnect.
+                    // self.state.set(State::Enumerated)
+                    // }
+                    // }
                 }
                 0x23 => {
                     // On Mac, we seem to get the SEND_BREAK to signal that a
@@ -317,6 +334,23 @@ impl<'a, U: hil::usb::UsbController<'a>> hil::usb::Client<'a> for CdcAcm<'a, U> 
 
     /// Handle a Control Out transaction
     fn ctrl_out(&'a self, endpoint: usize, packet_bytes: u32) -> hil::usb::CtrlOutResult {
+        match self.control_request.take() {
+            Some(CdcControlRequests::SetLineCoding) => {
+                let baud_rate = (self.client_ctrl.ctrl_buffer.buf[0].get() as u32) << 0
+                    | (self.client_ctrl.ctrl_buffer.buf[1].get() as u32) << 8
+                    | (self.client_ctrl.ctrl_buffer.buf[2].get() as u32) << 16
+                    | (self.client_ctrl.ctrl_buffer.buf[3].get() as u32) << 24;
+                debug!("baud {}", baud_rate);
+
+                if baud_rate == self.baud_rate.get() && self.state.get() != State::Connected {
+                    // We weren't previously connected so this must mean
+                    // a client connected.
+                    self.state.set(State::Connecting);
+                }
+            }
+            _ => {}
+        }
+
         self.client_ctrl.ctrl_out(endpoint, packet_bytes)
     }
 
@@ -484,7 +518,8 @@ impl<'a, U: hil::usb::UsbController<'a>> hil::usb::Client<'a> for CdcAcm<'a, U> 
 }
 
 impl<'a, U: hil::usb::UsbController<'a>> uart::Configure for CdcAcm<'a, U> {
-    fn configure(&self, _parameters: uart::Parameters) -> ReturnCode {
+    fn configure(&self, parameters: uart::Parameters) -> ReturnCode {
+        self.baud_rate.set(parameters.baud_rate);
         // Since this is not a real UART, we don't need to consider these
         // parameters.
         ReturnCode::SUCCESS
